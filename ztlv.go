@@ -503,7 +503,7 @@ func (d *Decoder) ReadTLVTime(expected Tag) (time.Time, error) {
 //
 // Usage:
 //
-//	err := dec.ReadNested(TagUser, func(d *zerotlv.Decoder) error {
+//	err := dec.ReadNested(TagUser, func(d *ztlv.Decoder) error {
 //	    name, _ := d.ReadTLVString(TagName)
 //	    age, _ := d.ReadTLVUint8(TagAge)
 //	    return nil
