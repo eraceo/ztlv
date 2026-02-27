@@ -487,6 +487,25 @@ func (d *Decoder) ReadTLVBytes(expected Tag) ([]byte, error) {
 	return d.ReadBytes()
 }
 
+// ReadTLVBytesInto reads a Tag, verifies it, reads Length, checks buffer size,
+// and reads bytes directly into the provided buffer.
+// This is the most efficient and secure way to read bytes without allocation.
+func (d *Decoder) ReadTLVBytesInto(expected Tag, buf []byte) (int, error) {
+	if err := d.VerifyTag(expected); err != nil {
+		return 0, err
+	}
+	length, err := d.ReadLength()
+	if err != nil {
+		return 0, err
+	}
+	if uint32(len(buf)) < length {
+		return 0, ErrShortBuffer
+	}
+	// Read directly into the user-provided buffer
+	_, err = io.ReadFull(d.r, buf[:length])
+	return int(length), err
+}
+
 // ReadTLVTime reads a Tag, verifies it, reads Length (must be 12), then reads Time.
 func (d *Decoder) ReadTLVTime(expected Tag) (time.Time, error) {
 	if err := d.VerifyTag(expected); err != nil {
@@ -522,7 +541,7 @@ func (d *Decoder) ReadNested(expected Tag, fn func(*Decoder) error) error {
 
 	// Create a new decoder for this limited scope
 	nestedDec := NewDecoder(limitReader)
-	// Inherit configuration from parent (optional, but good practice)
+	// Inherit configuration from parent (critical fix)
 	nestedDec.MaxStringSize = d.MaxStringSize
 	nestedDec.MaxBytesSize = d.MaxBytesSize
 	nestedDec.MaxListCount = d.MaxListCount
@@ -563,13 +582,14 @@ func (d *Decoder) ReadBytes() ([]byte, error) {
 // ReadBytesInto enables "Zero Alloc" scenarios if the caller reuses their buffer.
 // Warning: This method reads strictly 'length' bytes. It does NOT read the length prefix itself.
 // The caller must have read the length beforehand (e.g. via ReadLength()).
-func (d *Decoder) ReadBytesInto(length uint32, buf []byte) error {
+// It returns the number of bytes read (which is always equal to length on success) and any error.
+func (d *Decoder) ReadBytesInto(length uint32, buf []byte) (int, error) {
 	if uint32(len(buf)) < length {
-		return ErrShortBuffer
+		return 0, ErrShortBuffer
 	}
 	// Read directly into the user-provided buffer
 	_, err := io.ReadFull(d.r, buf[:length])
-	return err
+	return int(length), err
 }
 
 // ReadString uses "unsafe" optimizations (Go 1.20+) to reduce allocations.

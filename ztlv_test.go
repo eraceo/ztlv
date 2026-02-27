@@ -101,8 +101,9 @@ func TestReadBytesInto_ZeroAlloc(t *testing.T) {
 
 	// User provides buffer
 	myBuf := make([]byte, 4)
-	err = dec.ReadBytesInto(length, myBuf)
+	n, err := dec.ReadBytesInto(length, myBuf)
 	require.NoError(t, err)
+	assert.Equal(t, 4, n)
 	assert.Equal(t, data, myBuf)
 
 	// Test Error Case: Buffer too small
@@ -114,15 +115,41 @@ func TestReadBytesInto_ZeroAlloc(t *testing.T) {
 	require.NoError(t, err)
 
 	smallBuf := make([]byte, 2) // Too small
-	err = dec.ReadBytesInto(length, smallBuf)
+	_, err = dec.ReadBytesInto(length, smallBuf)
 	require.ErrorIs(t, err, ztlv.ErrShortBuffer)
 
 	// Since ReadBytesInto failed fast (without reading from reader), the data is still there!
 	// We can retry with a bigger buffer!
 	bigBuf := make([]byte, 4)
-	err = dec.ReadBytesInto(length, bigBuf)
+	n, err = dec.ReadBytesInto(length, bigBuf)
 	require.NoError(t, err)
+	assert.Equal(t, 4, n)
 	assert.Equal(t, data, bigBuf)
+}
+
+func TestReadTLVBytesInto(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	enc := ztlv.NewEncoder(&buf)
+	dec := ztlv.NewDecoder(&buf)
+
+	data := []byte{0x01, 0x02, 0x03}
+	require.NoError(t, enc.WriteTLVBytes(0xAA, data))
+
+	myBuf := make([]byte, 3)
+	n, err := dec.ReadTLVBytesInto(0xAA, myBuf)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+	assert.Equal(t, data, myBuf)
+
+	// Test Short Buffer Error (Safe check)
+	buf.Reset()
+	require.NoError(t, enc.WriteTLVBytes(0xBB, data))
+
+	shortBuf := make([]byte, 2)
+	_, err = dec.ReadTLVBytesInto(0xBB, shortBuf)
+	require.ErrorIs(t, err, ztlv.ErrShortBuffer)
 }
 
 func TestReadNested(t *testing.T) {
