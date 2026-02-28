@@ -611,8 +611,9 @@ func (d *Decoder) ReadString() (string, error) {
 		return "", err
 	}
 
-	// unsafe.String avoids a SECOND allocation (byte->string copy).
-	// Since 'buf' does not escape the function scope, this is safe.
+	// unsafe.String avoids a COPY (byte->string).
+	// Note: 'buf' technically escapes to the heap because the string is returned,
+	// but we save the CPU cost of copying the data into a new string structure.
 	return unsafe.String(unsafe.SliceData(buf), length), nil
 }
 
@@ -622,7 +623,8 @@ func (d *Decoder) ReadStrings() ([]string, error) {
 		return nil, err
 	}
 	if count == 0 {
-		return nil, nil
+		// Consistent with ReadBytes: return empty slice, not nil
+		return []string{}, nil
 	}
 	if count > d.MaxListCount {
 		return nil, fmt.Errorf("%w: %d > %d", ErrListTooLarge, count, d.MaxListCount)
