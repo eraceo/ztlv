@@ -110,12 +110,11 @@ if uint32(cap(buf)) < length {
 }
 
 // 3. Read payload directly into the slice (Zero Allocation)
-err = dec.ReadBytesInto(length, buf)
+n, err := dec.ReadBytesInto(length, buf)
 if err != nil {
     handleError(err)
 }
-
-process(buf[:length])
+process(buf[:n])
 ```
 
 ## Security Configuration

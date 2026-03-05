@@ -23,6 +23,7 @@ const (
 	DefaultMaxStringSize = 1 << 20  // 1 MB
 	DefaultMaxBytesSize  = 10 << 20 // 10 MB
 	DefaultMaxListCount  = 1000
+	DefaultMaxSkipSize   = 10 << 20 // 10 MB
 )
 
 type Tag byte
@@ -151,9 +152,7 @@ func (e *Encoder) WriteString(s string) error {
 }
 
 func (e *Encoder) WriteStrings(strs []string) error {
-	if len(strs) > math.MaxUint32 {
-		return ErrListTooLarge
-	}
+	// Use a direct cast; WriteLength handles the uint32 boundary.
 	if err := e.WriteLength(uint32(len(strs))); err != nil {
 		return err
 	}
@@ -260,6 +259,14 @@ func (e *Encoder) WriteTLVFloat64(tag Tag, v float64) error {
 	return e.WriteTLVUint64(tag, math.Float64bits(v))
 }
 
+// WriteTLVStrings writes a Tag, then the list of strings (count + each string TLV).
+func (e *Encoder) WriteTLVStrings(tag Tag, strs []string) error {
+	if err := e.WriteTag(tag); err != nil {
+		return err
+	}
+	return e.WriteStrings(strs)
+}
+
 // --- DECODER ---
 
 type Decoder struct {
@@ -268,6 +275,8 @@ type Decoder struct {
 	MaxStringSize uint32
 	MaxBytesSize  uint32
 	MaxListCount  uint32
+	// This prevents blocking on malicious huge unknown tags.
+	MaxSkipSize uint32
 }
 
 func NewDecoder(r io.Reader) *Decoder {
@@ -276,6 +285,7 @@ func NewDecoder(r io.Reader) *Decoder {
 		MaxStringSize: DefaultMaxStringSize,
 		MaxBytesSize:  DefaultMaxBytesSize,
 		MaxListCount:  DefaultMaxListCount,
+		MaxSkipSize:   DefaultMaxSkipSize,
 	}
 }
 
@@ -514,6 +524,14 @@ func (d *Decoder) ReadTLVTime(expected Tag) (time.Time, error) {
 	return d.ReadTimePrefixed()
 }
 
+// ReadTLVStrings reads a Tag, verifies it, then reads the list of strings.
+func (d *Decoder) ReadTLVStrings(expected Tag) ([]string, error) {
+	if err := d.VerifyTag(expected); err != nil {
+		return nil, err
+	}
+	return d.ReadStrings()
+}
+
 // ReadNested handles a TLV container (a TLV that contains other TLVs).
 // It reads the Tag and Length, creates a limited Decoder for the body, and executes the callback.
 //
@@ -545,6 +563,7 @@ func (d *Decoder) ReadNested(expected Tag, fn func(*Decoder) error) error {
 	nestedDec.MaxStringSize = d.MaxStringSize
 	nestedDec.MaxBytesSize = d.MaxBytesSize
 	nestedDec.MaxListCount = d.MaxListCount
+	nestedDec.MaxSkipSize = d.MaxSkipSize
 
 	if err := fn(nestedDec); err != nil {
 		return err
@@ -640,7 +659,11 @@ func (d *Decoder) ReadStrings() ([]string, error) {
 	return strs, nil
 }
 
+// Skip discards n bytes from the stream.
 func (d *Decoder) Skip(n uint32) error {
+	if n > d.MaxSkipSize {
+		return fmt.Errorf("%w: skip %d > %d", ErrPayloadTooLarge, n, d.MaxSkipSize)
+	}
 	_, err := io.CopyN(io.Discard, d.r, int64(n))
 	return err
 }
