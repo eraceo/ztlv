@@ -623,8 +623,7 @@ func (d *Decoder) ReadStrings() ([]string, error) {
 		return nil, err
 	}
 	if count == 0 {
-		// Consistent with ReadBytes: return empty slice, not nil
-		return []string{}, nil
+		return nil, nil
 	}
 	if count > d.MaxListCount {
 		return nil, fmt.Errorf("%w: %d > %d", ErrListTooLarge, count, d.MaxListCount)
