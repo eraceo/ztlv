@@ -83,9 +83,8 @@ func main() {
 		ts, _ := dec.ReadTimePrefixed()
 		log.Printf("Timestamp: %s", ts)
 	default:
-		// Efficiently skip unknown tags without allocation
-		len, _ := dec.ReadLength()
-		_ = dec.Skip(len)
+		// SkipTLV reads Length + discards payload — no allocation
+		_ = dec.SkipTLV()
 	}
 }
 ```
@@ -147,4 +146,4 @@ dec.MaxListCount  = 5000            // Limit list items
 *   **Primitives**: 0 allocs/op.
 *   **Strings**: 1 alloc/op (buffer only, no string copy).
 *   **Bytes**: 1 alloc/op (or 0 if using `ReadBytesInto`).
-*   **Skip**: 0 allocs/op (uses `io.Discard`).
+*   **SkipTLV**: 0 allocs/op (uses `io.Discard`).

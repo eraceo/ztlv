@@ -673,3 +673,18 @@ func FuzzDecoder(f *testing.F) {
 		}
 	})
 }
+
+func BenchmarkReadUint64(b *testing.B) {
+	var buf bytes.Buffer
+	enc := ztlv.NewEncoder(&buf)
+	_ = enc.WriteUint64(12345678)
+	data := buf.Bytes()
+	reader := bytes.NewReader(data)
+	dec := ztlv.NewDecoder(reader)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		reader.Reset(data)
+		_, _ = dec.ReadUint64()
+	}
+}

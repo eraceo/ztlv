@@ -152,7 +152,10 @@ func (e *Encoder) WriteString(s string) error {
 }
 
 func (e *Encoder) WriteStrings(strs []string) error {
-	// Use a direct cast; WriteLength handles the uint32 boundary.
+	if len(strs) > math.MaxUint32 {
+		return ErrPayloadTooLarge
+	}
+	// #nosec G115
 	if err := e.WriteLength(uint32(len(strs))); err != nil {
 		return err
 	}
@@ -636,6 +639,11 @@ func (d *Decoder) ReadString() (string, error) {
 	return unsafe.String(unsafe.SliceData(buf), length), nil
 }
 
+// ReadStrings decodes a list of strings.
+// Returns nil (not []string{}) for an empty list — this is intentional and idiomatic in Go.
+// Callers should use len(strs) == 0 rather than strs == nil to test for emptiness.
+// Note: this differs from ReadBytes which returns []byte{} for empty payloads,
+// because a nil byte slice can cause unexpected downstream panics; a nil string slice cannot.
 func (d *Decoder) ReadStrings() ([]string, error) {
 	count, err := d.ReadLength()
 	if err != nil {
@@ -666,4 +674,15 @@ func (d *Decoder) Skip(n uint32) error {
 	}
 	_, err := io.CopyN(io.Discard, d.r, int64(n))
 	return err
+}
+
+// This is a convenience helper to avoid error-prone manual ReadLength+Skip patterns
+// in decode loops when encountering unknown tags.
+
+func (d *Decoder) SkipTLV() error {
+	length, err := d.ReadLength()
+	if err != nil {
+		return err
+	}
+	return d.Skip(length)
 }
