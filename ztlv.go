@@ -550,6 +550,7 @@ func (d *Decoder) ReadNested(expected Tag, fn func(*Decoder) error) error {
 	if err != nil {
 		return err
 	}
+
 	lr := io.LimitedReader{R: d.r, N: int64(length)}
 
 	nestedDec := Decoder{
@@ -565,6 +566,11 @@ func (d *Decoder) ReadNested(expected Tag, fn func(*Decoder) error) error {
 	}
 
 	_, err = io.Copy(io.Discard, &lr)
+
+	if err == nil && lr.N > 0 {
+		return io.ErrUnexpectedEOF
+	}
+
 	return err
 }
 
