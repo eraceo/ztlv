@@ -143,7 +143,21 @@ dec.MaxListCount  = 5000            // Limit list items
 
 ## Performance
 
-*   **Primitives**: 0 allocs/op.
-*   **Strings**: 1 alloc/op (buffer only, no string copy).
-*   **Bytes**: 1 alloc/op (or 0 if using `ReadBytesInto`).
-*   **SkipTLV**: 0 allocs/op (uses `io.Discard`).
+Benchmarks on AMD Ryzen 9 7900 (amd64, Go 1.22):
+
+| Operation                    | Time     | Allocs |
+|------------------------------|----------|--------|
+| WriteUint64                  | 4.2 ns   | 0      |
+| ReadUint64                   | 6.6 ns   | 0      |
+| WriteString (~38B)           | 12.5 ns  | 0      |
+| ReadString (~38B)            | 25.7 ns  | 1      |
+| ReadBytesInto (1KB, reuse)   | 21.4 ns  | 0      |
+| SkipTLV (256B)               | 16.8 ns  | 0      |
+| Roundtrip uint64             | 32.5 ns  | 0      |
+| Roundtrip message (4 fields) | 139 ns   | 1      |
+
+- **Primitives** (`uint8` → `uint64`, `bool`, `time`): 0 allocs/op via stack-allocated scratch buffer.
+- **Strings**: 1 alloc/op — buffer only, no extra copy thanks to `unsafe.String`.
+- **Bytes**: 1 alloc/op, or **0** with `ReadBytesInto` + `sync.Pool`.
+- **Skip**: 0 allocs/op — uses `io.Seeker` fast-path on in-memory streams, pre-allocated `LimitedReader` fallback on network streams.
+- **Encoder/Decoder**: reusable via `Reset()` — eliminates allocations in hot loops.
