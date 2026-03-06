@@ -40,6 +40,9 @@ func (e *UnexpectedTagError) Error() string {
 	return fmt.Sprintf("ztlv: expected tag 0x%02X, got 0x%02X", e.Expected, e.Actual)
 }
 
+func (e *Encoder) Reset(w io.Writer) { e.w = w }
+func (d *Decoder) Reset(r io.Reader) { d.r = r }
+
 // Encoder remains lightweight. Allocations are primarily handled by the underlying Writer.
 type Encoder struct {
 	w       io.Writer
@@ -280,6 +283,7 @@ type Decoder struct {
 	MaxListCount  uint32
 	// This prevents blocking on malicious huge unknown tags.
 	MaxSkipSize uint32
+	limitReader io.LimitedReader
 }
 
 func NewDecoder(r io.Reader) *Decoder {
@@ -537,17 +541,7 @@ func (d *Decoder) ReadTLVStrings(expected Tag) ([]string, error) {
 
 // ReadNested handles a TLV container (a TLV that contains other TLVs).
 // It reads the Tag and Length, creates a limited Decoder for the body, and executes the callback.
-//
-// Security: The nested decoder is strictly limited to the container's length.
-// It prevents reading past the container boundary.
-//
-// Usage:
-//
-//	err := dec.ReadNested(TagUser, func(d *ztlv.Decoder) error {
-//	    name, _ := d.ReadTLVString(TagName)
-//	    age, _ := d.ReadTLVUint8(TagAge)
-//	    return nil
-//	})
+
 func (d *Decoder) ReadNested(expected Tag, fn func(*Decoder) error) error {
 	if err := d.VerifyTag(expected); err != nil {
 		return err
@@ -556,27 +550,21 @@ func (d *Decoder) ReadNested(expected Tag, fn func(*Decoder) error) error {
 	if err != nil {
 		return err
 	}
+	lr := io.LimitedReader{R: d.r, N: int64(length)}
 
-	// Create a limited reader that allows reading ONLY 'length' bytes
-	limitReader := io.LimitReader(d.r, int64(length))
+	nestedDec := Decoder{
+		r:             &lr,
+		MaxStringSize: d.MaxStringSize,
+		MaxBytesSize:  d.MaxBytesSize,
+		MaxListCount:  d.MaxListCount,
+		MaxSkipSize:   d.MaxSkipSize,
+	}
 
-	// Create a new decoder for this limited scope
-	nestedDec := NewDecoder(limitReader)
-	// Inherit configuration from parent (critical fix)
-	nestedDec.MaxStringSize = d.MaxStringSize
-	nestedDec.MaxBytesSize = d.MaxBytesSize
-	nestedDec.MaxListCount = d.MaxListCount
-	nestedDec.MaxSkipSize = d.MaxSkipSize
-
-	if err := fn(nestedDec); err != nil {
+	if err := fn(&nestedDec); err != nil {
 		return err
 	}
 
-	// Ensure we drain any unread bytes from the nested structure
-	// so the parent decoder is correctly positioned for the next TLV.
-	// io.LimitReader stops at EOF when limit is reached.
-	// If the user didn't read everything, we must skip the rest.
-	_, err = io.Copy(io.Discard, limitReader)
+	_, err = io.Copy(io.Discard, &lr)
 	return err
 }
 
@@ -672,7 +660,20 @@ func (d *Decoder) Skip(n uint32) error {
 	if n > d.MaxSkipSize {
 		return fmt.Errorf("%w: skip %d > %d", ErrPayloadTooLarge, n, d.MaxSkipSize)
 	}
-	_, err := io.CopyN(io.Discard, d.r, int64(n))
+
+	if seeker, ok := d.r.(io.Seeker); ok {
+		_, err := seeker.Seek(int64(n), io.SeekCurrent)
+		return err
+	}
+
+	d.limitReader.R = d.r
+	d.limitReader.N = int64(n)
+	written, err := io.Copy(io.Discard, &d.limitReader)
+
+	if err == nil && written < int64(n) {
+		return io.EOF
+	}
+
 	return err
 }
 

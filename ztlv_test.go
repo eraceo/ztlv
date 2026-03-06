@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
+	"sync"
 	"testing"
 	"time"
 
@@ -686,5 +687,274 @@ func BenchmarkReadUint64(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		reader.Reset(data)
 		_, _ = dec.ReadUint64()
+	}
+}
+
+// BenchmarkReadBytesInto_ZeroAlloc proves the 0 alloc path when the caller
+// reuses a pre-allocated buffer. This is the primary selling point of the lib.
+func BenchmarkReadBytesInto_ZeroAlloc(b *testing.B) {
+	var buf bytes.Buffer
+	enc := ztlv.NewEncoder(&buf)
+	payload := make([]byte, 1024) // 1KB payload
+	_ = enc.WriteBytes(payload)
+	data := buf.Bytes()
+
+	reader := bytes.NewReader(data)
+	dec := ztlv.NewDecoder(reader)
+
+	// Pre-allocated buffer reused across iterations — no GC pressure
+	reuseBuf := make([]byte, 1024)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		reader.Reset(data)
+
+		length, _ := dec.ReadLength()
+		_, _ = dec.ReadBytesInto(length, reuseBuf)
+	}
+}
+
+// BenchmarkWriteUint64 is the encode-side counterpart to BenchmarkReadUint64.
+// Both should show 0 allocs/op thanks to the scratch buffer.
+func BenchmarkWriteUint64(b *testing.B) {
+	var buf bytes.Buffer
+	enc := ztlv.NewEncoder(&buf)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		_ = enc.WriteUint64(12345678)
+	}
+}
+
+// BenchmarkWriteString is the encode-side counterpart to BenchmarkReadString.
+// Should show 0 allocs/op — the encoder writes directly to the underlying Writer.
+func BenchmarkWriteString(b *testing.B) {
+	var buf bytes.Buffer
+	enc := ztlv.NewEncoder(&buf)
+	payload := "Standard string for benchmark purposes"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		_ = enc.WriteString(payload)
+	}
+}
+
+// BenchmarkRoundtrip_Primitive measures a full encode+decode cycle for a uint64.
+// This is the baseline cost of using ztlv at the primitive level.
+func BenchmarkRoundtrip_Primitive(b *testing.B) {
+	const tag = ztlv.Tag(0x01)
+	var buf bytes.Buffer
+
+	enc := ztlv.NewEncoder(&buf)
+	dec := ztlv.NewDecoder(&buf)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		enc.Reset(&buf)
+
+		// Encode
+		_ = enc.WriteTLVUint64(tag, 9876543210)
+
+		dec.Reset(&buf)
+		_, _ = dec.ReadTLVUint64(tag)
+	}
+}
+
+// BenchmarkRoundtrip_Message measures a full encode+decode cycle for a realistic
+// message with mixed field types. This is the most representative benchmark for
+// real-world usage and the most compelling number for potential adopters.
+//
+// Message structure:
+//   - TagID      (0x01) uint64
+//   - TagName    (0x02) string  (~20 chars)
+//   - TagCreated (0x03) time.Time
+//   - TagActive  (0x04) bool
+func BenchmarkRoundtrip_Message(b *testing.B) {
+	const (
+		tagID      = ztlv.Tag(0x01)
+		tagName    = ztlv.Tag(0x02)
+		tagCreated = ztlv.Tag(0x03)
+		tagActive  = ztlv.Tag(0x04)
+	)
+
+	now := time.Now().UTC()
+	name := "jean-baptiste.dupont"
+
+	var buf bytes.Buffer
+
+	enc := ztlv.NewEncoder(&buf)
+	dec := ztlv.NewDecoder(&buf)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+
+		// --- Encode ---
+		enc.Reset(&buf)
+
+		_ = enc.WriteTLVUint64(tagID, 42)
+		_ = enc.WriteTLVString(tagName, name)
+		_ = enc.WriteTLVTime(tagCreated, now)
+		_ = enc.WriteTLVBool(tagActive, true)
+
+		// --- Decode ---
+		dec.Reset(&buf)
+
+		_, _ = dec.ReadTLVUint64(tagID)
+		_, _ = dec.ReadTLVString(tagName)
+		_, _ = dec.ReadTLVTime(tagCreated)
+		_, _ = dec.ReadTLVBool(tagActive)
+	}
+}
+
+// BenchmarkReadNested measures the overhead introduced by ReadNested's
+// io.LimitReader wrapper. The question: is the boundary enforcement cheap enough?
+func BenchmarkReadNested(b *testing.B) {
+	const (
+		tagContainer = ztlv.Tag(0xAA)
+		tagID        = ztlv.Tag(0x01)
+		tagName      = ztlv.Tag(0x02)
+	)
+
+	// Build the nested payload once
+	var inner bytes.Buffer
+	innerEnc := ztlv.NewEncoder(&inner)
+	_ = innerEnc.WriteTLVUint64(tagID, 1234)
+	_ = innerEnc.WriteTLVString(tagName, "alice")
+
+	var outer bytes.Buffer
+	outerEnc := ztlv.NewEncoder(&outer)
+	_ = outerEnc.WriteTag(tagContainer)
+	_ = outerEnc.WriteLength(uint32(inner.Len()))
+	_, _ = outer.Write(inner.Bytes())
+
+	data := outer.Bytes()
+	reader := bytes.NewReader(data)
+	dec := ztlv.NewDecoder(reader)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		reader.Reset(data)
+
+		_ = dec.ReadNested(tagContainer, func(d *ztlv.Decoder) error {
+			_, _ = d.ReadTLVUint64(tagID)
+			_, _ = d.ReadTLVString(tagName)
+			return nil
+		})
+	}
+}
+
+// BenchmarkReadString_Small vs BenchmarkReadString_Large shows how the lib scales
+// with payload size. Useful to identify if there are fixed overheads.
+
+func BenchmarkReadString_Small(b *testing.B) {
+	benchmarkReadString(b, 16) // ~16 bytes
+}
+
+func BenchmarkReadString_Medium(b *testing.B) {
+	benchmarkReadString(b, 256) // ~256 bytes
+}
+
+func BenchmarkReadString_Large(b *testing.B) {
+	benchmarkReadString(b, 1<<20) // 1 MB
+}
+
+func benchmarkReadString(b *testing.B, size int) {
+	b.Helper()
+
+	payload := string(make([]byte, size))
+
+	var buf bytes.Buffer
+	enc := ztlv.NewEncoder(&buf)
+	_ = enc.WriteString(payload)
+	data := buf.Bytes()
+
+	reader := bytes.NewReader(data)
+	dec := ztlv.NewDecoder(reader)
+
+	b.SetBytes(int64(size))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		reader.Reset(data)
+		_, _ = dec.ReadString()
+	}
+}
+
+// BenchmarkReadBytesInto_Pool demonstrates the fully zero-alloc end-to-end path
+// using sync.Pool for buffer management. This is the recommended pattern for
+// hot paths in production systems.
+func BenchmarkReadBytesInto_Pool(b *testing.B) {
+	const payloadSize = 1024
+
+	pool := &sync.Pool{
+		New: func() any {
+			buf := make([]byte, payloadSize)
+			return &buf
+		},
+	}
+
+	var buf bytes.Buffer
+	enc := ztlv.NewEncoder(&buf)
+	_ = enc.WriteBytes(make([]byte, payloadSize))
+	data := buf.Bytes()
+
+	reader := bytes.NewReader(data)
+	dec := ztlv.NewDecoder(reader)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		reader.Reset(data)
+
+		length, _ := dec.ReadLength()
+
+		bufPtr := pool.Get().(*[]byte)
+		_, _ = dec.ReadBytesInto(length, *bufPtr)
+		pool.Put(bufPtr)
+	}
+}
+
+// BenchmarkSkipTLV confirms 0 allocs/op on the unknown-tag hot path.
+// A parser that encounters unknown tags frequently must skip cheaply.
+func BenchmarkSkipTLV(b *testing.B) {
+	const tag = ztlv.Tag(0x01)
+	payload := make([]byte, 256)
+
+	var buf bytes.Buffer
+	enc := ztlv.NewEncoder(&buf)
+	_ = enc.WriteTLVBytes(tag, payload)
+	data := buf.Bytes()
+
+	// Skip the tag byte manually (SkipTLV reads length + discards payload)
+	// We simulate the decode loop: ReadTag → unknown → SkipTLV
+	reader := bytes.NewReader(data)
+	dec := ztlv.NewDecoder(reader)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		reader.Reset(data)
+
+		_, _ = dec.ReadTag() // consume the tag (unknown in a real loop)
+		_ = dec.SkipTLV()    // skip length + payload — must be 0 alloc
 	}
 }
