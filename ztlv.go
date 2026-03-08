@@ -26,6 +26,10 @@ const (
 	DefaultMaxSkipSize   = 10 << 20 // 10 MB
 )
 
+// Tag is a single-byte TLV identifier (0x00–0xFF).
+// NOTE: 256 possible tags is a known limitation of this format.
+// If your protocol requires more identifiers, consider a two-byte tag
+// or varint encoding — this is a planned future extension.
 type Tag byte
 
 // --- ERROR HANDLING ---
@@ -284,6 +288,10 @@ type Decoder struct {
 	// This prevents blocking on malicious huge unknown tags.
 	MaxSkipSize uint32
 	limitReader io.LimitedReader
+	// nestedDec is a lazily-initialized reusable Decoder for ReadNested.
+	// Using a pointer avoids the "invalid recursive type" compile error,
+	// while still allowing reuse across calls (allocated at most once per Decoder).
+	nestedDec *Decoder
 }
 
 func NewDecoder(r io.Reader) *Decoder {
@@ -541,7 +549,10 @@ func (d *Decoder) ReadTLVStrings(expected Tag) ([]string, error) {
 
 // ReadNested handles a TLV container (a TLV that contains other TLVs).
 // It reads the Tag and Length, creates a limited Decoder for the body, and executes the callback.
-
+//
+// The nested Decoder is reused from d.nestedDec to avoid a heap allocation per call.
+// Any unread bytes within the container are drained automatically after the callback returns,
+// ensuring the parent stream remains correctly positioned.
 func (d *Decoder) ReadNested(expected Tag, fn func(*Decoder) error) error {
 	if err := d.VerifyTag(expected); err != nil {
 		return err
@@ -551,27 +562,42 @@ func (d *Decoder) ReadNested(expected Tag, fn func(*Decoder) error) error {
 		return err
 	}
 
-	lr := io.LimitedReader{R: d.r, N: int64(length)}
-
-	nestedDec := Decoder{
-		r:             &lr,
-		MaxStringSize: d.MaxStringSize,
-		MaxBytesSize:  d.MaxBytesSize,
-		MaxListCount:  d.MaxListCount,
-		MaxSkipSize:   d.MaxSkipSize,
+	// Lazily allocate the nested decoder once per parent Decoder instance.
+	// A *Decoder pointer is required because Go forbids directly recursive struct types.
+	// After the first call, nestedDec is reused — only one heap allocation total.
+	if d.nestedDec == nil {
+		d.nestedDec = &Decoder{}
 	}
+	nd := d.nestedDec
 
-	if err := fn(&nestedDec); err != nil {
+	// Point the nested LimitedReader at the parent's reader, capped to the container length.
+	nd.limitReader.R = d.r
+	nd.limitReader.N = int64(length)
+
+	// Propagate limits from the parent decoder.
+	nd.r = &nd.limitReader
+	nd.MaxStringSize = d.MaxStringSize
+	nd.MaxBytesSize = d.MaxBytesSize
+	nd.MaxListCount = d.MaxListCount
+	nd.MaxSkipSize = d.MaxSkipSize
+
+	if err := fn(nd); err != nil {
 		return err
 	}
 
-	_, err = io.Copy(io.Discard, &lr)
-
-	if err == nil && lr.N > 0 {
-		return io.ErrUnexpectedEOF
+	// Drain any bytes the callback left unread.
+	// This guarantees the parent decoder is correctly positioned at the next TLV,
+	// regardless of how much the callback consumed.
+	if _, copyErr := io.Copy(io.Discard, &nd.limitReader); copyErr != nil {
+		return copyErr
+	}
+	// After a successful drain, lr.N must be exactly 0.
+	// If it is still > 0, the reader hit EOF inside the container — corrupted stream.
+	if nd.limitReader.N > 0 {
+		return fmt.Errorf("ztlv: nested container truncated: %d bytes unread after drain", nd.limitReader.N)
 	}
 
-	return err
+	return nil
 }
 
 // ReadBytes is optimized for a single allocation.
@@ -634,10 +660,15 @@ func (d *Decoder) ReadString() (string, error) {
 }
 
 // ReadStrings decodes a list of strings.
-// Returns nil (not []string{}) for an empty list — this is intentional and idiomatic in Go.
+//
+// NOTE: Returns nil (not []string{}) for an empty list — this is intentional and idiomatic in Go.
 // Callers should use len(strs) == 0 rather than strs == nil to test for emptiness.
-// Note: this differs from ReadBytes which returns []byte{} for empty payloads,
+//
+// This differs from ReadBytes which returns []byte{} for empty payloads,
 // because a nil byte slice can cause unexpected downstream panics; a nil string slice cannot.
+//
+// This asymmetry is a known API rough edge. Always use len(result) == 0 for both types
+// to write forward-compatible code.
 func (d *Decoder) ReadStrings() ([]string, error) {
 	count, err := d.ReadLength()
 	if err != nil {
@@ -683,9 +714,8 @@ func (d *Decoder) Skip(n uint32) error {
 	return err
 }
 
-// This is a convenience helper to avoid error-prone manual ReadLength+Skip patterns
+// SkipTLV is a convenience helper to avoid error-prone manual ReadLength+Skip patterns
 // in decode loops when encountering unknown tags.
-
 func (d *Decoder) SkipTLV() error {
 	length, err := d.ReadLength()
 	if err != nil {
