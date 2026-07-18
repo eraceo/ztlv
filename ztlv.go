@@ -523,7 +523,7 @@ func (d *Decoder) ReadTLVBytesInto(expected Tag, buf []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if uint32(len(buf)) < length {
+	if uint64(len(buf)) < uint64(length) {
 		return 0, ErrShortBuffer
 	}
 	// Read directly into the user-provided buffer
@@ -626,7 +626,7 @@ func (d *Decoder) ReadBytes() ([]byte, error) {
 // The caller must have read the length beforehand (e.g. via ReadLength()).
 // It returns the number of bytes read (which is always equal to length on success) and any error.
 func (d *Decoder) ReadBytesInto(length uint32, buf []byte) (int, error) {
-	if uint32(len(buf)) < length {
+	if uint64(len(buf)) < uint64(length) {
 		return 0, ErrShortBuffer
 	}
 	// Read directly into the user-provided buffer
@@ -703,9 +703,8 @@ func (d *Decoder) Skip(n uint32) error {
 		return err
 	}
 
-	d.limitReader.R = d.r
-	d.limitReader.N = int64(n)
-	written, err := io.Copy(io.Discard, &d.limitReader)
+	lr := io.LimitedReader{R: d.r, N: int64(n)}
+	written, err := io.Copy(io.Discard, &lr)
 
 	if err == nil && written < int64(n) {
 		return io.EOF

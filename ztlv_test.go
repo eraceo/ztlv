@@ -958,3 +958,54 @@ func BenchmarkSkipTLV(b *testing.B) {
 		_ = dec.SkipTLV()    // skip length + payload — must be 0 alloc
 	}
 }
+
+type nonSeekerReader struct {
+	r io.Reader
+}
+
+func (ns nonSeekerReader) Read(p []byte) (int, error) {
+	return ns.r.Read(p)
+}
+
+func TestReadNested_SkipStackOverflow(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	enc := ztlv.NewEncoder(&buf)
+	
+	// Create a nested structure: Tag 0xAA containing:
+	// Tag 0x01 with string "hello"
+	// Tag 0x02 to skip with 10 bytes of payload
+	var innerBuf bytes.Buffer
+	innerEnc := ztlv.NewEncoder(&innerBuf)
+	require.NoError(t, innerEnc.WriteTLVString(0x01, "hello"))
+	require.NoError(t, innerEnc.WriteTLVBytes(0x02, make([]byte, 10)))
+
+	require.NoError(t, enc.WriteTag(0xAA))
+	require.NoError(t, enc.WriteLength(uint32(innerBuf.Len())))
+	_, err := buf.Write(innerBuf.Bytes())
+	require.NoError(t, err)
+
+	// Wrap in a non-seeker reader to force fallback path in Skip
+	nsReader := nonSeekerReader{r: &buf}
+	dec := ztlv.NewDecoder(nsReader)
+
+	err = dec.ReadNested(0xAA, func(d *ztlv.Decoder) error {
+		val, err := d.ReadTLVString(0x01)
+		require.NoError(t, err)
+		assert.Equal(t, "hello", val)
+
+		// Read tag first before calling SkipTLV
+		tag, err := d.ReadTag()
+		require.NoError(t, err)
+		assert.Equal(t, ztlv.Tag(0x02), tag)
+
+		// This will call Skip on the nested decoder.
+		// If there is a stack overflow bug, it will panic.
+		err = d.SkipTLV()
+		require.NoError(t, err)
+		return nil
+	})
+	require.NoError(t, err)
+}
+
