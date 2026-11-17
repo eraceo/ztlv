@@ -20,8 +20,27 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
+      - name: Vet
+        run: go vet ./...
       - name: Run Tests
         run: go test -v -race ./...
+      - name: Verify 32-bit Build
+        if: runner.os == 'Linux'
+        env:
+          GOARCH: "386"
+        run: go build ./... && go test -c -o /dev/null ./...
+
+  fuzz:
+    name: Fuzz Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Run FuzzDecoder
+        run: go test -run=^$ -fuzz=FuzzDecoder -fuzztime=5s ./...
 
   lint:
     name: Lint
@@ -33,6 +52,6 @@ jobs:
         with:
           go-version: "1.24"
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v4
+        uses: golangci/golangci-lint-action@v9
         with:
           version: latest

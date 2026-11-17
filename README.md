@@ -1,32 +1,33 @@
 # ztlv
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/eraceo/ztlv.svg)](https://pkg.go.dev/github.com/eraceo/ztlv)
-[![Go Report Card](https://goreportcard.com/badge/github.com/eraceo/ztlv)](https://goreportcard.com/report/github.com/eraceo/ztlv)
+[![Go Reference](https://pkg.go.dev/badge/github.com/eraceo/ztlv/v2.svg)](https://pkg.go.dev/github.com/eraceo/ztlv/v2)
+[![Go Report Card](https://goreportcard.com/badge/github.com/eraceo/ztlv/v2)](https://goreportcard.com/report/github.com/eraceo/ztlv/v2)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-`ztlv` is a secure, low-allocation Tag-Length-Value (TLV) parser for Go.
+`ztlv` is a secure, zero-dependency, low-allocation Tag-Length-Value (TLV) parser for Go.
 
-It is designed for network protocols, critical infrastructure, and high-throughput systems where memory pressure and input validation are paramount. It operates directly on `io.Reader` and `io.Writer` interfaces, enabling streaming of datasets larger than available RAM.
+It is designed for network protocols, binary framing, and high-throughput streaming systems where memory pressure and strict input validation are paramount. It operates directly on `io.Reader` and `io.Writer` interfaces, enabling streaming of payloads larger than available RAM.
 
 ## Design Principles
 
-*   **Security First**: Strict bounds checking prevents OOM (Out-Of-Memory) attacks. Integers are checked for overflows.
-*   **Low Allocation**: Primitives (Tags, Lengths, Time) are encoded/decoded using stack-allocated scratchpads.
-*   **Optimized Strings**: Uses `unsafe.String` (Go 1.20+) to convert byte buffers to strings without additional heap copying.
-*   **Robust Time**: Timestamps are stored as 96-bit (64-bit Seconds + 32-bit Nanoseconds) to prevent Y2262 issues and maintain precision.
-*   **Big Endian**: All numeric values conform to standard network byte order.
+*   **Zero Dependencies**: Pure Go standard library — zero runtime and zero test dependencies.
+*   **Security First**: Strict bounds checking (`MaxStringSize`, `MaxBytesSize`, `MaxListCount`, `MaxSkipSize`) prevents OOM and infinite-drain DoS attacks. Timestamps reject out-of-range nanoseconds (`>= 1e9`), and `Skip` validates EOF on both seekable and non-seekable streams.
+*   **Low / Zero Allocation**: Fixed TLV headers and primitives are batched in stack-embedded scratch buffers (`17` bytes on `Encoder`, `12` bytes on `Decoder`). Reused `nestedBuf`/`nestedDec` and embedded `io.LimitedReader` fields eliminate per-call heap allocations.
+*   **Optimized Strings**: Uses `unsafe.String` (Go 1.20+) to wrap the freshly allocated read buffer without a second heap copy.
+*   **Robust Time**: Timestamps are stored as 96-bit (`int64` Seconds + `uint32` Nanoseconds, UTC) to avoid Y2038 and Y2262 limits.
+*   **Big Endian**: All multi-byte numeric values and lengths use standard network byte order.
 
 ## Installation
 
 ```bash
-go get github.com/eraceo/ztlv
+go get github.com/eraceo/ztlv/v2
 ```
 
 ## Usage
 
 ### Encoder
 
-The encoder wraps an `io.Writer`. It performs no heap allocations for primitive types.
+The encoder wraps any `io.Writer`. Fixed-width `WriteTLV*` methods batch tag, length, and value into a single `Write` call with zero heap allocations.
 
 ```go
 package main
@@ -34,130 +35,181 @@ package main
 import (
 	"bytes"
 	"time"
-	"github.com/eraceo/ztlv"
+
+	"github.com/eraceo/ztlv/v2"
 )
 
 func main() {
 	var buf bytes.Buffer
 	enc := ztlv.NewEncoder(&buf)
 
-	// Write Tag (0x01) + Length + String
-	_ = enc.WriteTLVString(0x01, "admin")
+	const (
+		tagUser      ztlv.Tag = 0x01
+		tagTimestamp ztlv.Tag = 0x02
+		tagActive    ztlv.Tag = 0x03
+	)
 
-	// Write Tag (0x02) + Length + Time (12 bytes)
-	_ = enc.WriteTLVTime(0x02, time.Now())
+	// Write Tag + Length + Payload
+	_ = enc.WriteTLVString(tagUser, "admin")
+	_ = enc.WriteTLVTime(tagTimestamp, time.Now().UTC())
+	_ = enc.WriteTLVBool(tagActive, true)
 }
 ```
 
-### Decoder
+### Decoder (`ReadTag` Switch Loop)
 
-The decoder wraps an `io.Reader` and enforces configurable limits.
+Use `ReadTag()` together with `*Prefixed` methods (`ReadUint64Prefixed`, `ReadBoolPrefixed`, `ReadTimePrefixed`, `ReadStringsPrefixed`, `ReadNestedBody`, `ReadString`, `ReadBytes`) to handle optional, out-of-order, or unknown fields safely with `SkipTLV()`.
 
 ```go
 package main
 
 import (
-	"bytes"
+	"errors"
+	"io"
 	"log"
-	"github.com/eraceo/ztlv"
+
+	"github.com/eraceo/ztlv/v2"
 )
 
-func main() {
-	// r is your io.Reader (e.g., net.Conn or bytes.Buffer)
+func decodeStream(r io.Reader) error {
+	const (
+		tagUser      ztlv.Tag = 0x01
+		tagTimestamp ztlv.Tag = 0x02
+		tagUserID    ztlv.Tag = 0x03
+	)
+
 	dec := ztlv.NewDecoder(r)
 
-	// Decode loop
-	tag, err := dec.ReadTag()
-	if err != nil {
-		log.Fatal(err)
-	}
+	for {
+		tag, err := dec.ReadTag()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 
-	switch tag {
-	case 0x01:
-		// Efficiently reads string (1 allocation only)
-		val, _ := dec.ReadString()
-		log.Printf("User: %s", val)
-	case 0x02:
-		// Efficiently reads Length + Time (0 allocation)
-		// Uses ReadTimePrefixed because WriteTLVTime includes a length.
-		ts, _ := dec.ReadTimePrefixed()
-		log.Printf("Timestamp: %s", ts)
-	default:
-		// SkipTLV reads Length + discards payload — no allocation
-		_ = dec.SkipTLV()
+		switch tag {
+		case tagUser:
+			val, err := dec.ReadString()
+			if err != nil {
+				return err
+			}
+			log.Printf("User: %s", val)
+		case tagTimestamp:
+			ts, err := dec.ReadTimePrefixed()
+			if err != nil {
+				return err
+			}
+			log.Printf("Timestamp: %s", ts)
+		case tagUserID:
+			id, err := dec.ReadUint64Prefixed()
+			if err != nil {
+				return err
+			}
+			log.Printf("ID: %d", id)
+		default:
+			// Unknown tag: reads Length and skips payload with 0 allocations.
+			if err := dec.SkipTLV(); err != nil {
+				return err
+			}
+		}
 	}
 }
+```
+
+When decoding fixed-order schemas, you can also use the `ReadTLV*` helpers (`ReadTLVString`, `ReadTLVUint64`, `ReadTLVTime`, `ReadTLVStrings`, `ReadNested`, etc.) which verify the expected tag automatically and return `*ztlv.UnexpectedTagError` (wrapping `ztlv.ErrInvalidTag`) on mismatch.
+
+### Nested Containers
+
+Use `WriteNested` and `ReadNested` (or `ReadNestedBody` inside a switch loop). Any unread trailing bytes inside a container are automatically drained (bounded by `MaxSkipSize`) so the parent stream stays aligned.
+
+```go
+err := enc.WriteNested(0xAA, func(inner *ztlv.Encoder) error {
+	if err := inner.WriteTLVString(0x01, "Alice"); err != nil {
+		return err
+	}
+	return inner.WriteTLVUint8(0x02, 30)
+})
 ```
 
 ### Advanced: Zero-Allocation Byte Reading
 
-For hot paths where garbage collection pressure must be eliminated, use `ReadBytesInto` with a reused buffer. This method separates length reading from payload reading to ensure stream integrity.
+For hot paths where GC pressure must be eliminated, reuse a buffer (for example from a `sync.Pool`) with `ReadBytesInto` or `ReadTLVBytesInto`. Both check `len(buf) >= length` (and `MaxBytesSize`) before consuming payload bytes from the stream, returning `*ztlv.ShortBufferError` (wrapping `ztlv.ErrShortBuffer`) if the slice is too short.
 
 ```go
-// Pre-allocated buffer (or retrieved from sync.Pool)
+// Pre-allocated buffer (with len == cap)
 buf := make([]byte, 4096)
-// 1. Read the length first
+
 length, err := dec.ReadLength()
 if err != nil {
-    handleError(err)
+	return err
 }
 
-// 2. Check if buffer is large enough
-if uint32(cap(buf)) < length {
-    // Handle error, or grow buffer
-    handleError(fmt.Errorf("buffer too small"))
+if uint64(len(buf)) < uint64(length) {
+	return ztlv.ErrShortBuffer
 }
 
-// 3. Read payload directly into the slice (Zero Allocation)
 n, err := dec.ReadBytesInto(length, buf)
 if err != nil {
-    handleError(err)
+	return err
 }
 process(buf[:n])
 ```
 
+With `ReadTLVBytesInto`, if `errors.As(err, &shortErr)` matches `*ztlv.ShortBufferError`, you can allocate `make([]byte, shortErr.Required)` and recover the remaining payload immediately with `dec.ReadBytesInto(shortErr.Required, biggerBuf)`.
+
 ## Security Configuration
 
-To prevent Denial of Service (DoS) attacks via malicious length prefixes, the decoder enforces default sanity limits. These can be adjusted per instance.
+To prevent Denial of Service (DoS) attacks via malicious length prefixes or oversized unknown containers, the decoder enforces default sanity limits that can be adjusted per instance:
 
 ```go
 dec := ztlv.NewDecoder(r)
 
-// Adjust limits based on your protocol requirements
-dec.MaxStringSize = 64 * 1024       // Limit strings to 64KB
-dec.MaxBytesSize  = 10 * 1024 * 1024 // Limit raw blobs to 10MB
-dec.MaxListCount  = 5000            // Limit list items
+dec.MaxStringSize = 64 * 1024        // Limit strings to 64 KiB (default: 1 MiB)
+dec.MaxBytesSize  = 10 * 1024 * 1024 // Limit raw blobs to 10 MiB (default: 10 MiB)
+dec.MaxListCount  = 5000             // Limit string list items (default: 1000)
+dec.MaxSkipSize   = 10 * 1024 * 1024 // Limit Skip / nested drain (default: 10 MiB)
 ```
 
-## Binary Format Specification
+## Supported Types & Binary Format
 
 | Component | Size | Type | Description |
 |-----------|------|------|-------------|
-| **Tag** | 1 byte | `uint8` | Identifier (0-255). |
-| **Length** | 4 bytes | `uint32` | Payload size in bytes (Big Endian). |
+| **Tag** | 1 byte | `uint8` | Identifier (`0x00`–`0xFF`). |
+| **Length** | 4 bytes | `uint32` | Payload byte size (Big Endian). |
 | **Value** | *N* bytes | Raw | Payload data. |
 
-**Time Format**: Stored as 12 bytes.
-- Bytes 0-7: Seconds (`int64`, Big Endian)
-- Bytes 8-11: Nanoseconds (`uint32`, Big Endian)
+Supported types (raw `Write*`/`Read*`, `*Prefixed` decoder, and `WriteTLV*`/`ReadTLV*`):
+- Integers: `uint8`, `uint16`, `uint32`, `uint64`, `int8`, `int16`, `int32`, `int64`
+- Floats: `float32`, `float64` (IEEE 754 Big Endian)
+- Boolean: `bool` (1 byte: `0x01` true, `0x00` false)
+- Time: `time.Time` (12 bytes: `int64` seconds + `uint32` nanoseconds `[0, 999999999]`, returned in UTC)
+- Slices & Text: `[]byte`, `string`, `[]string`
+- Containers: nested TLV streams via `WriteNested` / `ReadNested` / `ReadNestedBody`
+
+**String List TLV Format (`WriteTLVStrings` / `ReadTLVStrings`)**:
+- `Tag` (1B) + `TotalPayloadBytes` (`uint32`, 4B) + `Count` (`uint32`, 4B) + `[Len_i (4B) + Bytes_i]...`
+- Storing `TotalPayloadBytes` in the TLV `Length` header ensures `SkipTLV()` can skip unknown string lists safely without desynchronizing the stream.
 
 ## Performance
 
-Benchmarks on AMD Ryzen 9 7900 (amd64, Go 1.22):
+Benchmarks measured on AMD Ryzen 9 7900 (`linux/amd64`, Go 1.22.2):
 
-| Operation                    | Time     | Allocs |
-|------------------------------|----------|--------|
-| WriteUint64                  | 4.2 ns   | 0      |
-| ReadUint64                   | 6.6 ns   | 0      |
-| WriteString (~38B)           | 12.5 ns  | 0      |
-| ReadString (~38B)            | 25.7 ns  | 1      |
-| ReadBytesInto (1KB, reuse)   | 21.4 ns  | 0      |
-| SkipTLV (256B)               | 16.8 ns  | 0      |
-| Roundtrip uint64             | 32.5 ns  | 0      |
-| Roundtrip message (4 fields) | 139 ns   | 1      |
+| Operation | Time | Allocs |
+|-----------|------|--------|
+| `WriteUint64` | 3.44 ns | 0 |
+| `ReadUint64` | 5.86 ns | 0 |
+| `WriteString` (~38B) | 8.03 ns | 0 |
+| `ReadString` (~38B) | 26.16 ns | 1 |
+| `ReadBytes` (1KB) | 139.4 ns | 1 |
+| `ReadBytesInto` (1KB, reuse) | 18.25 ns | 0 |
+| `ReadBytesInto` (1KB, `sync.Pool`) | 23.28 ns | 0 |
+| `SkipTLV` (256B, seekable) | 16.75 ns | 0 |
+| `SkipTLV` (256B, non-seekable stream) | 32.61 ns | 0 |
+| `Roundtrip_Primitive` (`uint64`) | 22.69 ns | 0 |
+| `Roundtrip_Message` (4 fields) | 101.9 ns | 1 |
+| `WriteNested` (2 fields, warm) | 19.44 ns | 0 |
+| `ReadNested` (2 fields, warm) | 63.23 ns | 1* |
 
-- **Primitives** (`uint8` → `uint64`, `bool`, `time`): 0 allocs/op via stack-allocated scratch buffer.
-- **Strings**: 1 alloc/op — buffer only, no extra copy thanks to `unsafe.String`.
-- **Bytes**: 1 alloc/op, or **0** with `ReadBytesInto` + `sync.Pool`.
-- **Skip**: 0 allocs/op — uses `io.Seeker` fast-path on in-memory streams, pre-allocated `LimitedReader` fallback on network streams.
-- **Encoder/Decoder**: reusable via `Reset()` — eliminates allocations in hot loops.
+*\*The single allocation in `ReadNested` comes from `ReadTLVString` inside the callback; `ReadNested` itself performs 0 allocations after first-call initialization.*
